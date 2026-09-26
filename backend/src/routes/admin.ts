@@ -1,0 +1,902 @@
+import { requireAdmin } from "../middleware/admin";
+import type { AppContext } from "../types";
+import {
+  deleteCloudinaryImage,
+  deleteCloudinaryVideo,
+  extractCloudinaryPublicId,
+  extractCloudinaryVideoPublicId,
+} from "../utils/cloudinary";
+import { decryptPasswordForAdmin } from "../utils/crypto";
+import { HttpError } from "../utils/errors";
+import { jsonResponse, parseJsonBody, parsePositiveIntParam } from "../utils/http";
+import { logAsyncWarning } from "../utils/logger";
+import {
+  parsePostExpiryMode,
+  readPostExpiryMode,
+  writePostExpiryMode,
+} from "../utils/postSettings";
+import { sanitizeUuid } from "../utils/sanitize";
+import {
+  fetchCloudinaryStorageUsage,
+  fetchSupabaseStorageUsage,
+} from "../utils/storageUsage";
+
+interface ModerateUserRequestBody {
+  user_id?: unknown;
+  is_banned?: unknown;
+  is_shadow_banned?: unknown;
+}
+
+interface AdminDeletePostRequestBody {
+  post_id?: unknown;
+}
+
+interface AdminHidePostRequestBody {
+  post_id?: unknown;
+  hidden?: unknown;
+}
+
+interface AdminDeleteUserRequestBody {
+  user_id?: unknown;
+}
+
+interface AdminSetPostExpiryRequestBody {
+  mode?: unknown;
+}
+
+type AdminUserFilter = "all" | "active" | "banned" | "online";
+
+const ONLINE_WINDOW_MS = 15 * 60 * 1000;
+
+interface AdminUserDetailsRequestLog {
+  id: string;
+  ip_address: string;
+  method: string;
+  path: string;
+  user_agent: string | null;
+  cf_country: string | null;
+  cf_region: string | null;
+  cf_city: string | null;
+  cf_colo: string | null;
+  cf_asn: number | null;
+  cf_ray: string | null;
+  created_at: string;
+}
+
+function asBoolean(value: unknown): boolean | null {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  return null;
+}
+
+function asCount(value: number | null): number {
+  return typeof value === "number" ? value : 0;
+}
+
+function escapeLikePattern(input: string): string {
+  return input.replace(/[\\%_]/g, "\\$&");
+}
+
+function parseAdminUserFilter(value: string | null): AdminUserFilter {
+  if (!value) {
+    return "all";
+  }
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === "all" ||
+    normalized === "active" ||
+    normalized === "banned" ||
+    normalized === "online"
+  ) {
+    return normalized;
+  }
+  throw new HttpError(400, "filter must be all, active, banned, or online");
+}
+
+async function fetchOnlineUserIds(ctx: AppContext): Promise<Set<string>> {
+  const nowMs = Date.now();
+  const thresholdIso = new Date(nowMs - ONLINE_WINDOW_MS).toISOString();
+  const sessions = await ctx.supabase
+    .from("sessions")
+    .select("user_id,expires_at,last_active")
+    .gte("last_active", thresholdIso)
+    .limit(5_000);
+
+  if (sessions.error) {
+    throw new HttpError(500, "Failed to fetch active sessions", { expose: false });
+  }
+
+  return new Set(
+    (sessions.data ?? [])
+      .filter((session) => {
+        if (!session.expires_at) {
+          return true;
+        }
+        const expiresMs = Date.parse(session.expires_at);
+        return Number.isFinite(expiresMs) && expiresMs > nowMs;
+      })
+      .map((session) => session.user_id),
+  );
+}
+
+async function logAdminAction(
+  ctx: AppContext,
+  payload: {
+    action: string;
+    targetUserId?: string;
+    targetPostId?: string;
+  },
+): Promise<void> {
+  const insert = await ctx.supabase.from("admin_actions").insert({
+    action: payload.action,
+    target_user_id: payload.targetUserId ?? null,
+    target_post_id: payload.targetPostId ?? null,
+  });
+  if (insert.error && insert.error.code !== "42P01") {
+    throw new HttpError(500, "Failed to log admin action", { expose: false });
+  }
+}
+
+export async function handleAdminModerateUser(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const body = await parseJsonBody<ModerateUserRequestBody>(ctx.request);
+  const userId = sanitizeUuid(body.user_id);
+  const isBanned = asBoolean(body.is_banned);
+  const isShadowBanned = asBoolean(body.is_shadow_banned);
+
+  if (!userId) {
+    throw new HttpError(400, "user_id must be a valid UUID");
+  }
+  if (isBanned === null && isShadowBanned === null) {
+    throw new HttpError(400, "Provide is_banned and/or is_shadow_banned");
+  }
+
+  const patch: Record<string, unknown> = {};
+  if (isBanned !== null) {
+    patch.is_banned = isBanned;
+    patch.banned_at = isBanned ? new Date().toISOString() : null;
+    if (isBanned) {
+      patch.is_active = false;
+      patch.deactivated_at = new Date().toISOString();
+    }
+  }
+  if (isShadowBanned !== null) {
+    patch.is_shadow_banned = isShadowBanned;
+  }
+
+  const update = await ctx.supabase.from("users").update(patch).eq("id", userId);
+  if (update.error && update.error.code !== "42703") {
+    throw new HttpError(500, "Failed to update user moderation", { expose: false });
+  }
+
+  if (isBanned === true) {
+    await ctx.supabase.from("sessions").delete().eq("user_id", userId);
+  }
+
+  await logAdminAction(ctx, {
+    action: "moderate_user",
+    targetUserId: userId,
+  });
+
+  return jsonResponse({
+    success: true,
+    user_id: userId,
+    is_banned: isBanned,
+    is_shadow_banned: isShadowBanned,
+  });
+}
+
+export async function handleAdminDeletePost(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const body = await parseJsonBody<AdminDeletePostRequestBody>(ctx.request);
+  const postId = sanitizeUuid(body.post_id);
+  if (!postId) {
+    throw new HttpError(400, "post_id must be a valid UUID");
+  }
+
+  const postLookup = await ctx.supabase
+    .from("posts")
+    .select("id,image_url,image_public_id,video_url,video_public_id")
+    .eq("id", postId)
+    .maybeSingle();
+
+  if (postLookup.error && postLookup.error.code !== "42703") {
+    throw new HttpError(500, "Failed to fetch post", { expose: false });
+  }
+
+  let postData = postLookup.data;
+  if (postLookup.error?.code === "42703") {
+    const fallbackLookupWithVideo = await ctx.supabase
+      .from("posts")
+      .select("id,image_url,video_url")
+      .eq("id", postId)
+      .maybeSingle();
+
+    if (!fallbackLookupWithVideo.error) {
+      postData = fallbackLookupWithVideo.data
+        ? {
+            ...fallbackLookupWithVideo.data,
+            image_public_id: null,
+            video_public_id: null,
+          }
+        : null;
+    } else if (fallbackLookupWithVideo.error.code === "42703") {
+      const fallbackLookup = await ctx.supabase
+        .from("posts")
+        .select("id,image_url")
+        .eq("id", postId)
+        .maybeSingle();
+
+      if (fallbackLookup.error) {
+        throw new HttpError(500, "Failed to fetch post", { expose: false });
+      }
+
+      postData = fallbackLookup.data
+        ? {
+            ...fallbackLookup.data,
+            image_public_id: null,
+            video_url: null,
+            video_public_id: null,
+          }
+        : null;
+    } else {
+      throw new HttpError(500, "Failed to fetch post", { expose: false });
+    }
+  }
+
+  if (!postData) {
+    throw new HttpError(404, "Post not found");
+  }
+
+  const imagePublicId =
+    postData.image_public_id ??
+    (postData.image_url
+      ? extractCloudinaryPublicId(postData.image_url, ctx.config.cloudinaryCloudName)
+      : null);
+  const videoPublicId =
+    postData.video_public_id ??
+    (postData.video_url
+      ? extractCloudinaryVideoPublicId(postData.video_url, ctx.config.cloudinaryCloudName)
+      : null);
+
+  if (imagePublicId || videoPublicId) {
+    try {
+      if (imagePublicId) {
+        await deleteCloudinaryImage(ctx.config, imagePublicId);
+      }
+      if (videoPublicId) {
+        await deleteCloudinaryVideo(ctx.config, videoPublicId);
+      }
+    } catch {
+      logAsyncWarning(
+        ctx,
+        "admin.post.delete.cloudinary_cleanup_failed",
+        "Cloudinary cleanup failed during admin post deletion",
+      );
+    }
+  }
+
+  await cleanupPostDependencies(ctx, postId);
+
+  const deletion = await ctx.supabase
+    .from("posts")
+    .delete()
+    .eq("id", postId)
+    .select("id")
+    .maybeSingle();
+
+  if (deletion.error) {
+    throw new HttpError(500, "Failed to remove post", { expose: false });
+  }
+  if (!deletion.data) {
+    throw new HttpError(404, "Post not found");
+  }
+
+  await logAdminAction(ctx, {
+    action: `delete_post:${postId}`,
+  });
+
+  return jsonResponse({
+    success: true,
+    post_id: postId,
+  });
+}
+
+async function cleanupPostDependencies(ctx: AppContext, postId: string): Promise<void> {
+  const results = await Promise.all([
+    ctx.supabase.from("comments").delete().eq("post_id", postId),
+    ctx.supabase.from("post_reactions").delete().eq("post_id", postId),
+    ctx.supabase.from("saved_posts").delete().eq("post_id", postId),
+    ctx.supabase.from("reports").delete().eq("content_type", "post").eq("content_id", postId),
+    ctx.supabase.from("admin_actions").delete().eq("target_post_id", postId),
+    ctx.supabase.from("notifications").delete().eq("entity_type", "post").eq("entity_id", postId),
+  ]);
+
+  for (const result of results) {
+    if (result.error && result.error.code !== "42P01" && result.error.code !== "42703") {
+      throw new HttpError(500, "Failed to remove post dependencies", { expose: false });
+    }
+  }
+}
+
+export async function handleAdminHidePost(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const body = await parseJsonBody<AdminHidePostRequestBody>(ctx.request);
+  const postId = sanitizeUuid(body.post_id);
+  const hidden = asBoolean(body.hidden) ?? true;
+
+  if (!postId) {
+    throw new HttpError(400, "post_id must be a valid UUID");
+  }
+
+  const update = await ctx.supabase
+    .from("posts")
+    .update({
+      hidden,
+    })
+    .eq("id", postId)
+    .select("id")
+    .limit(1);
+
+  if (update.error) {
+    throw new HttpError(500, "Failed to update post visibility", { expose: false });
+  }
+  if (!update.data || update.data.length === 0) {
+    throw new HttpError(404, "Post not found");
+  }
+
+  await logAdminAction(ctx, {
+    action: hidden ? "hide_post" : "unhide_post",
+    targetPostId: postId,
+  });
+
+  return jsonResponse({
+    success: true,
+    post_id: postId,
+    hidden,
+  });
+}
+
+export async function handleAdminDeleteUser(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const body = await parseJsonBody<AdminDeleteUserRequestBody>(ctx.request);
+  const userId = sanitizeUuid(body.user_id);
+  if (!userId) {
+    throw new HttpError(400, "user_id must be a valid UUID");
+  }
+
+  const deletion = await ctx.supabase
+    .from("users")
+    .delete()
+    .eq("id", userId)
+    .select("id")
+    .limit(1);
+
+  if (deletion.error) {
+    throw new HttpError(500, "Failed to delete user", { expose: false });
+  }
+  if (!deletion.data || deletion.data.length === 0) {
+    throw new HttpError(404, "User not found");
+  }
+
+  await logAdminAction(ctx, {
+    action: `delete_user:${userId}`,
+  });
+
+  return jsonResponse({
+    success: true,
+    user_id: userId,
+  });
+}
+
+export async function handleAdminOverview(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const nowMs = Date.now();
+  const onlineThresholdIso = new Date(nowMs - ONLINE_WINDOW_MS).toISOString();
+
+  const [
+    totalUsersResult,
+    activeUsersResult,
+    bannedUsersResult,
+    totalPostsResult,
+    hiddenPostsResult,
+    totalReportsResult,
+    recentSessionsResult,
+    postExpiryMode,
+    supabaseStorage,
+    cloudinaryStorage,
+  ] = await Promise.all([
+    ctx.supabase.from("users").select("id", { count: "exact", head: true }),
+    ctx.supabase
+      .from("users")
+      .select("id", { count: "exact", head: true })
+      .eq("is_active", true),
+    ctx.supabase
+      .from("users")
+      .select("id", { count: "exact", head: true })
+      .eq("is_banned", true),
+    ctx.supabase.from("posts").select("id", { count: "exact", head: true }),
+    ctx.supabase.from("posts").select("id", { count: "exact", head: true }).eq("hidden", true),
+    ctx.supabase.from("reports").select("id", { count: "exact", head: true }),
+    ctx.supabase
+      .from("sessions")
+      .select("user_id,last_active,expires_at")
+      .gte("last_active", onlineThresholdIso)
+      .limit(5_000),
+    readPostExpiryMode(ctx),
+    fetchSupabaseStorageUsage(ctx),
+    fetchCloudinaryStorageUsage(ctx.config),
+  ]);
+
+  if (
+    totalUsersResult.error ||
+    activeUsersResult.error ||
+    bannedUsersResult.error ||
+    totalPostsResult.error ||
+    hiddenPostsResult.error ||
+    totalReportsResult.error ||
+    recentSessionsResult.error
+  ) {
+    throw new HttpError(500, "Failed to fetch admin overview", { expose: false });
+  }
+
+  const onlineUsers = new Set(
+    (recentSessionsResult.data ?? [])
+      .filter((session) => {
+        if (!session.expires_at) {
+          return true;
+        }
+        const expiresMs = Date.parse(session.expires_at);
+        return Number.isFinite(expiresMs) && expiresMs > nowMs;
+      })
+      .map((session) => session.user_id),
+  );
+
+  return jsonResponse({
+    stats: {
+      total_users: asCount(totalUsersResult.count),
+      active_users: asCount(activeUsersResult.count),
+      banned_users: asCount(bannedUsersResult.count),
+      online_users: onlineUsers.size,
+      total_posts: asCount(totalPostsResult.count),
+      hidden_posts: asCount(hiddenPostsResult.count),
+      total_reports: asCount(totalReportsResult.count),
+    },
+    settings: {
+      post_expiry_mode: postExpiryMode,
+    },
+    storage: {
+      supabase: {
+        used_bytes: supabaseStorage.usedBytes,
+        limit_bytes: supabaseStorage.limitBytes,
+        available: supabaseStorage.available,
+      },
+      cloudinary: {
+        used_bytes: cloudinaryStorage.usedBytes,
+        limit_bytes: cloudinaryStorage.limitBytes,
+        available: cloudinaryStorage.available,
+      },
+    },
+  });
+}
+
+export async function handleAdminSetPostExpiry(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const body = await parseJsonBody<AdminSetPostExpiryRequestBody>(ctx.request);
+  const mode = parsePostExpiryMode(body.mode);
+  if (!mode) {
+    throw new HttpError(400, "mode must be one of: 7d, 15d, 30d, forever");
+  }
+
+  await writePostExpiryMode(ctx, mode);
+  await logAdminAction(ctx, {
+    action: `set_post_expiry:${mode}`,
+  });
+
+  return jsonResponse({
+    success: true,
+    post_expiry_mode: mode,
+  });
+}
+
+export async function handleAdminUsers(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const url = new URL(ctx.request.url);
+  const filter = parseAdminUserFilter(url.searchParams.get("filter"));
+  const limit = parsePositiveIntParam(url.searchParams.get("limit"), {
+    min: 1,
+    max: 200,
+    fallback: 50,
+    invalidMessage: "limit must be between 1 and 200",
+  });
+  const queryText = (url.searchParams.get("q") ?? "").trim();
+  const onlineUserIds = await fetchOnlineUserIds(ctx);
+
+  const runUsersQuery = async (selectClause: string) => {
+    let query = ctx.supabase
+      .from("users")
+      .select(selectClause)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (queryText) {
+      query = query.ilike("username", `%${escapeLikePattern(queryText)}%`);
+    }
+
+    if (filter === "active") {
+      query = query.eq("is_active", true);
+    } else if (filter === "banned") {
+      query = query.eq("is_banned", true);
+    } else if (filter === "online") {
+      const ids = [...onlineUserIds];
+      if (ids.length === 0) {
+        return { data: [], error: null as null };
+      }
+      query = query.in("id", ids);
+    }
+
+    return query;
+  };
+
+  let { data, error } = await runUsersQuery(
+    "id,username,password_hash,password_ciphertext,recovery_key_hash,created_at,trust_score,is_active,is_banned,is_shadow_banned,bio,avatar_url",
+  );
+  if (error?.code === "42703") {
+    ({ data, error } = await runUsersQuery(
+      "id,username,password_hash,recovery_key_hash,created_at,trust_score,is_active,is_banned,is_shadow_banned",
+    ));
+  }
+  if (error?.code === "42703") {
+    ({ data, error } = await runUsersQuery(
+      "id,username,recovery_key_hash,created_at,trust_score,is_active,is_banned,is_shadow_banned",
+    ));
+  }
+  if (error) {
+    throw new HttpError(500, "Failed to fetch users", { expose: false });
+  }
+  const users = (data ?? []) as unknown as Array<{
+    id: string;
+    username: string;
+    password_hash?: string | null;
+    password_ciphertext?: string | null;
+    recovery_key_hash: string;
+    created_at: string;
+    trust_score: number;
+    is_active?: boolean;
+    is_banned?: boolean;
+    is_shadow_banned?: boolean;
+    bio?: string | null;
+    avatar_url?: string | null;
+  }>;
+
+  const mappedUsers = await Promise.all(
+    users.map(async (user) => ({
+      id: user.id,
+      username: user.username,
+      password_hash: user.password_hash ?? null,
+      password_plain: await decryptPasswordForAdmin(
+        user.password_ciphertext ?? null,
+        ctx.config.adminPasswordEncryptionKey,
+      ),
+      recovery_key_hash: user.recovery_key_hash,
+      created_at: user.created_at,
+      trust_score: user.trust_score,
+      is_active: Boolean(user.is_active),
+      is_banned: Boolean(user.is_banned),
+      is_shadow_banned: Boolean(user.is_shadow_banned),
+      bio: user.bio ?? null,
+      avatar_url: user.avatar_url ?? null,
+      is_online: onlineUserIds.has(user.id),
+    })),
+  );
+
+  return jsonResponse({
+    users: mappedUsers,
+  });
+}
+
+export async function handleAdminUserDetails(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const url = new URL(ctx.request.url);
+  const userId = sanitizeUuid(url.searchParams.get("user_id"));
+  if (!userId) {
+    throw new HttpError(400, "user_id must be a valid UUID");
+  }
+
+  const logLimit = parsePositiveIntParam(url.searchParams.get("log_limit"), {
+    min: 1,
+    max: 500,
+    fallback: 100,
+    invalidMessage: "log_limit must be between 1 and 500",
+  });
+
+  const sessionLimit = parsePositiveIntParam(url.searchParams.get("session_limit"), {
+    min: 1,
+    max: 100,
+    fallback: 20,
+    invalidMessage: "session_limit must be between 1 and 100",
+  });
+
+  let userLookup = await ctx.supabase
+    .from("users")
+    .select(
+      "id,username,created_at,trust_score,is_active,is_banned,is_shadow_banned,bio,avatar_url",
+    )
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (userLookup.error?.code === "42703") {
+    userLookup = await ctx.supabase
+      .from("users")
+      .select("id,username,created_at,trust_score")
+      .eq("id", userId)
+      .maybeSingle();
+  }
+
+  if (userLookup.error) {
+    throw new HttpError(500, "Failed to fetch user details", { expose: false });
+  }
+  if (!userLookup.data) {
+    throw new HttpError(404, "User not found");
+  }
+
+  let sessions: Array<{
+    id: string;
+    device_hash: string | null;
+    created_at: string | null;
+    last_active: string | null;
+    expires_at: string | null;
+  }> = [];
+
+  const sessionsPrimary = await ctx.supabase
+    .from("sessions")
+    .select("id,device_hash,created_at,last_active,expires_at")
+    .eq("user_id", userId)
+    .order("last_active", { ascending: false })
+    .limit(sessionLimit);
+
+  if (!sessionsPrimary.error) {
+    sessions = (sessionsPrimary.data ?? []).map((row) => ({
+      id: row.id,
+      device_hash: row.device_hash ?? null,
+      created_at: row.created_at ?? null,
+      last_active: row.last_active ?? row.created_at ?? null,
+      expires_at: row.expires_at ?? null,
+    }));
+  } else if (sessionsPrimary.error.code === "42703") {
+    const sessionsFallback = await ctx.supabase
+      .from("sessions")
+      .select("id,device_hash,created_at")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(sessionLimit);
+
+    if (sessionsFallback.error && sessionsFallback.error.code !== "42703") {
+      throw new HttpError(500, "Failed to fetch user sessions", { expose: false });
+    }
+
+    sessions = (sessionsFallback.data ?? []).map((row) => ({
+      id: row.id,
+      device_hash: row.device_hash ?? null,
+      created_at: row.created_at ?? null,
+      last_active: row.created_at ?? null,
+      expires_at: null,
+    }));
+  } else {
+    throw new HttpError(500, "Failed to fetch user sessions", { expose: false });
+  }
+
+  let requestLogs: AdminUserDetailsRequestLog[] = [];
+  let loggingAvailable = true;
+  const logsPrimary = await ctx.supabase
+    .from("user_request_logs")
+    .select(
+      "id,ip_address,method,path,user_agent,cf_country,cf_region,cf_city,cf_colo,cf_asn,cf_ray,created_at",
+    )
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(logLimit);
+
+  if (!logsPrimary.error) {
+    requestLogs = (logsPrimary.data ?? []) as AdminUserDetailsRequestLog[];
+  } else if (logsPrimary.error.code === "42P01" || logsPrimary.error.code === "42703") {
+    loggingAvailable = false;
+  } else {
+    throw new HttpError(500, "Failed to fetch request logs", { expose: false });
+  }
+
+  const ipIndex = new Map<string, { count: number; last_seen_at: string }>();
+  for (const row of requestLogs) {
+    const current = ipIndex.get(row.ip_address);
+    if (!current) {
+      ipIndex.set(row.ip_address, {
+        count: 1,
+        last_seen_at: row.created_at,
+      });
+      continue;
+    }
+    current.count += 1;
+    if (new Date(row.created_at).getTime() > new Date(current.last_seen_at).getTime()) {
+      current.last_seen_at = row.created_at;
+    }
+  }
+
+  const ipSummary = [...ipIndex.entries()]
+    .map(([ip_address, summary]) => ({
+      ip_address,
+      count: summary.count,
+      last_seen_at: summary.last_seen_at,
+    }))
+    .sort((left, right) => {
+      return new Date(right.last_seen_at).getTime() - new Date(left.last_seen_at).getTime();
+    });
+
+  return jsonResponse({
+    user: {
+      id: userLookup.data.id,
+      username: userLookup.data.username,
+      created_at: userLookup.data.created_at,
+      trust_score: userLookup.data.trust_score,
+      is_active: "is_active" in userLookup.data ? Boolean(userLookup.data.is_active) : true,
+      is_banned: "is_banned" in userLookup.data ? Boolean(userLookup.data.is_banned) : false,
+      is_shadow_banned:
+        "is_shadow_banned" in userLookup.data
+          ? Boolean(userLookup.data.is_shadow_banned)
+          : false,
+      bio: "bio" in userLookup.data ? userLookup.data.bio ?? null : null,
+      avatar_url:
+        "avatar_url" in userLookup.data ? userLookup.data.avatar_url ?? null : null,
+    },
+    sessions,
+    request_logs: requestLogs,
+    ip_summary: ipSummary,
+    logging_available: loggingAvailable,
+  });
+}
+
+export async function handleAdminPosts(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const url = new URL(ctx.request.url);
+  const limit = parsePositiveIntParam(url.searchParams.get("limit"), {
+    min: 1,
+    max: 200,
+    fallback: 50,
+    invalidMessage: "limit must be between 1 and 200",
+  });
+  const queryText = (url.searchParams.get("q") ?? "").trim();
+  const includeHidden = url.searchParams.get("include_hidden") !== "false";
+
+  const runPostsQuery = async (selectClause: string) => {
+    let query = ctx.supabase
+      .from("posts")
+      .select(selectClause)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (!includeHidden) {
+      query = query.eq("hidden", false);
+    }
+    if (queryText) {
+      query = query.ilike("content", `%${escapeLikePattern(queryText)}%`);
+    }
+
+    return query;
+  };
+
+  let { data, error } = await runPostsQuery(
+    "id,user_id,channel,content,image_url,video_url,created_at,expires_at,hidden,report_count,deleted_at",
+  );
+  if (error?.code === "42703") {
+    ({ data, error } = await runPostsQuery(
+      "id,user_id,channel,content,image_url,video_url,created_at,expires_at,hidden,report_count",
+    ));
+  }
+  if (error?.code === "42703") {
+    ({ data, error } = await runPostsQuery(
+      "id,user_id,channel,content,image_url,created_at,expires_at,hidden,report_count",
+    ));
+  }
+
+  if (error) {
+    throw new HttpError(500, "Failed to fetch posts", { expose: false });
+  }
+  const postRows = (data ?? []) as unknown as Array<{
+    id: string;
+    user_id: string;
+    channel: string;
+    content: string;
+    image_url: string | null;
+    video_url?: string | null;
+    created_at: string;
+    expires_at: string;
+    hidden: boolean;
+    report_count: number;
+    deleted_at?: string | null;
+  }>;
+
+  return jsonResponse({
+    posts: postRows.map((post) => ({
+      id: post.id,
+      user_id: post.user_id,
+      channel: post.channel,
+      content: post.content,
+      image_url: post.image_url,
+      video_url: post.video_url ?? null,
+      created_at: post.created_at,
+      expires_at: post.expires_at,
+      hidden: post.hidden,
+      report_count: post.report_count,
+      deleted_at: post.deleted_at ?? null,
+    })),
+  });
+}
+
+export async function handleAdminReports(ctx: AppContext): Promise<Response> {
+  requireAdmin(ctx);
+
+  const url = new URL(ctx.request.url);
+  const limit = parsePositiveIntParam(url.searchParams.get("limit"), {
+    min: 1,
+    max: 200,
+    fallback: 50,
+    invalidMessage: "limit must be between 1 and 200",
+  });
+  const contentType = url.searchParams.get("content_type")?.trim().toLowerCase();
+  if (contentType && contentType !== "post" && contentType !== "comment") {
+    throw new HttpError(400, "content_type must be post or comment");
+  }
+
+  const runReportsQuery = async (withReason: boolean) => {
+    let query = (ctx.supabase.from("reports") as any)
+      .select(
+        withReason
+          ? "id,content_type,content_id,reporter_id,reason,created_at"
+          : "id,content_type,content_id,reporter_id,created_at",
+      )
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (contentType) {
+      query = query.eq("content_type", contentType);
+    }
+
+    return query;
+  };
+
+  let { data, error } = await runReportsQuery(true);
+  if (error?.code === "42703") {
+    ({ data, error } = await runReportsQuery(false));
+  }
+  if (error) {
+    throw new HttpError(500, "Failed to fetch reports", { expose: false });
+  }
+  const reports = (data ?? []) as Array<{
+    id: string;
+    content_type: string;
+    content_id: string;
+    reporter_id: string | null;
+    created_at: string;
+    reason?: string | null;
+  }>;
+
+  return jsonResponse({
+    reports: reports.map((report) => ({
+      id: report.id,
+      content_type: report.content_type,
+      content_id: report.content_id,
+      reporter_id: report.reporter_id,
+      reason: report.reason ?? null,
+      created_at: report.created_at,
+    })),
+  });
+}
