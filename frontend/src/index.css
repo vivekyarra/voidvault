@@ -1,0 +1,296 @@
+:root {
+  color-scheme: dark;
+
+  --bg-void: #06070a;
+  --bg-deep: #0c0e13;
+  --bg-card: #111318;
+  --bg-card-2: #181c23;
+  --bg-input: #0d0f14;
+
+  --border-s: rgba(255, 255, 255, 0.06);
+  --border-d: rgba(255, 255, 255, 0.11);
+  --border-str: rgba(255, 255, 255, 0.18);
+
+  --text-1: #f4f5f8;
+  --text-2: #9ca3af;
+  --text-3: #6b7280;
+  --text-4: #4b5563;
+
+  --hover: rgba(255, 255, 255, 0.04);
+  --active: rgba(255, 255, 255, 0.08);
+  --focus: rgba(255, 255, 255, 0.07);
+
+  --danger: #ef4444;
+  --danger-d: rgba(239, 68, 68, 0.12);
+  --danger-b: rgba(239, 68, 68, 0.25);
+
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 20px;
+  --r-pill: 100px;
+
+  --sidebar: 280px;
+  --header: 64px;
+  --mob-bar: 64px;
+
+  /* Legacy aliases to keep existing component CSS stable. */
+  --border-subtle: var(--border-s);
+  --border-default: var(--border-d);
+  --border-strong: var(--border-str);
+  --text-primary: var(--text-1);
+  --text-secondary: var(--text-2);
+  --text-muted: var(--text-3);
+  --text-placeholder: var(--text-4);
+  --hover-fill: var(--hover);
+  --active-fill: var(--active);
+  --focus-ring: var(--focus);
+  --danger-dim: var(--danger-d);
+  --danger-border: var(--danger-b);
+  --sidebar-width: var(--sidebar);
+  --shadow-soft: 0 20px 44px rgba(0, 0, 0, 0.28);
+  --content-width: 1160px;
+
+  font-family: "Outfit", sans-serif;
+  color: var(--text-1);
+  background-color: var(--bg-void);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+  width: 100%;
+}
+
+html {
+  background: var(--bg-void);
+}
+
+body {
+  font-family: "Outfit", sans-serif;
+  background: var(--bg-void);
+  color: var(--text-1);
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-text-size-adjust: 100%;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button,
+a,
+[role="button"] {
+  touch-action: manipulation;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img,
+video {
+  max-width: 100%;
+}
+
+::selection {
+  color: var(--bg-void);
+  background: var(--text-1);
+}
+
+.field-input,
+.f-input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border-d);
+  border-radius: var(--r-md);
+  padding: 14px 16px;
+  font-family: "Outfit", sans-serif;
+  font-size: 16px;
+  font-weight: 400;
+  color: var(--text-1);
+  outline: none;
+  min-height: 52px;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+}
+
+.field-input::placeholder,
+.f-input::placeholder {
+  color: var(--text-4);
+}
+
+.field-input:focus,
+.f-input:focus {
+  border-color: var(--border-str);
+  box-shadow: 0 0 0 3px var(--focus);
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-ghost,
+.btn-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-family: "Outfit", sans-serif;
+  cursor: pointer;
+  min-height: 44px;
+  transition: opacity 0.15s ease, transform 0.15s ease, background-color 0.15s ease,
+    border-color 0.15s ease, color 0.15s ease;
+}
+
+.btn-primary {
+  background: var(--text-1);
+  color: var(--bg-void);
+  border: none;
+  border-radius: var(--r-md);
+  min-height: 50px;
+  padding: 0 24px;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.btn-primary:hover {
+  opacity: 0.9;
+  transform: translateY(-1px);
+}
+
+.btn-primary:active {
+  transform: scale(0.98);
+  opacity: 0.85;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--text-2);
+  border: 1px solid var(--border-d);
+  border-radius: var(--r-md);
+  min-height: 48px;
+  padding: 0 24px;
+  font-weight: 500;
+  font-size: 0.88rem;
+}
+
+.btn-secondary:hover {
+  background: var(--hover);
+  color: var(--text-1);
+  border-color: var(--border-str);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-3);
+  border: none;
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+  font-weight: 500;
+  font-size: 0.85rem;
+}
+
+.btn-ghost:hover {
+  background: var(--hover);
+  color: var(--text-1);
+}
+
+.btn-danger {
+  background: var(--danger-d);
+  color: var(--danger);
+  border: 1px solid var(--danger-b);
+  border-radius: var(--r-md);
+  min-height: 48px;
+  padding: 0 24px;
+  font-weight: 500;
+  font-size: 0.88rem;
+}
+
+.btn-danger:hover {
+  background: rgba(239, 68, 68, 0.2);
+}
+
+.ui-kicker {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.ui-display {
+  margin: 0;
+  font-family: "Bebas Neue", sans-serif;
+  font-weight: 400;
+  letter-spacing: 0.06em;
+}
+
+.ui-status {
+  margin: 0;
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 12px 14px;
+  color: var(--text-secondary);
+  font-size: 0.86rem;
+}
+
+.ui-status.is-danger {
+  border-color: var(--danger-b);
+  background: var(--danger-d);
+  color: var(--danger);
+}
+
+@media (max-width: 768px) {
+  .btn-primary {
+    min-height: 54px;
+  }
+
+  .btn-secondary,
+  .btn-danger {
+    min-height: 50px;
+  }
+}
+
+.ui-empty {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  padding: 64px 20px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.ui-empty .ui-display {
+  color: var(--text-secondary);
+  font-size: 1.5rem;
+}
+
+.ui-empty-brand {
+  width: 48px;
+  height: 39px;
+  opacity: 0.3;
+}
+
+.ui-empty p {
+  margin: 0;
+  max-width: 420px;
+  line-height: 1.6;
+}
